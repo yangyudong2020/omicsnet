@@ -1,0 +1,173 @@
+from torch import nn
+from timm.models.layers import trunc_normal_
+from typing import Sequence, Tuple, Union
+from monai.networks.layers.utils import get_norm_layer
+from monai.utils import optional_import
+from nnunetv2.training.nnUNetTrainer.synapse.layers import LayerNorm
+from nnunetv2.training.nnUNetTrainer.synapse.transformerblock_3d import TransformerBlock
+from nnunetv2.training.nnUNetTrainer.synapse.dynunet_block import get_conv_layer, UnetResBlock
+
+
+einops, _ = optional_import("einops")
+
+
+class UnetrPPEncoder(nn.Module):
+    def __init__(self, f_size, dims=[32, 64, 128, 256],
+                 proj_size=[64, 64, 64, 32], depths=[3, 3, 3, 3],  num_heads=4, spatial_dims=3, in_channels=1, dropout=0.0, transformer_dropout_rate=0.15, **kwargs):
+        super().__init__()
+
+        input_size = [f_size[0]*f_size[1]*f_size[2]*(2**6), f_size[0]*f_size[1]*f_size[2]*(2**3), f_size[0]*f_size[1]*f_size[2], f_size[0]*f_size[1]*f_size[2]//8]
+        # print('input_size is', input_size)
+        # stem and 3 intermediate downsampling conv layers
+        self.downsample_layers = nn.ModuleList()
+        stem_layer = nn.Sequential(
+            get_conv_layer(spatial_dims, in_channels, dims[0], kernel_size=(2, 4, 4), stride=(2, 2, 2),
+                           dropout=dropout, conv_only=True, ),
+            get_norm_layer(
+                name=("group", {"num_groups": in_channels}), channels=dims[0]),
+        )
+        self.downsample_layers.append(stem_layer)
+        for i in range(3):
+            downsample_layer = nn.Sequential(
+                get_conv_layer(spatial_dims, dims[i], dims[i + 1], kernel_size=(2, 2, 2), stride=(2, 2, 2),
+                               dropout=dropout, conv_only=True, ),
+                get_norm_layer(
+                    name=("group", {"num_groups": dims[i]}), channels=dims[i + 1]),
+            )
+            self.downsample_layers.append(downsample_layer)
+
+        # 4 feature resolution stages, each consisting of multiple Transformer blocks
+        self.stages = nn.ModuleList()
+        for i in range(4):
+            stage_blocks = []
+            for j in range(depths[i]):
+                stage_blocks.append(TransformerBlock(input_size=input_size[i], hidden_size=dims[i],  proj_size=proj_size[i], num_heads=num_heads,
+                                                     dropout_rate=transformer_dropout_rate, pos_embed=True))
+            self.stages.append(nn.Sequential(*stage_blocks))
+        self.hidden_states = []
+        # final_size = 180224
+        # self.feature_fc = [nn.Linear(final_size, final_size//16), nn.Linear(final_size//16, 512)]
+        # self.feature_fc = nn.Sequential(*self.feature_fc)
+        self.feature_fc = []
+        pre_features = 38400
+        # nxt_features = pre_features // 2
+        # while nxt_features > 512:
+        #     self.feature_fc.append(nn.Linear(pre_features, nxt_features))
+        #     self.feature_fc.append(nn.LeakyReLU())
+        #     pre_features = nxt_features
+        #     nxt_features = nxt_features // 2
+            
+        # if nxt_features != 512:
+        #     self.feature_fc.append(nn.Linear(pre_features, 512))
+        #     self.feature_fc.append(nn.LeakyReLU())
+        
+        # self.feature_fc = nn.Sequential(*self.feature_fc)
+        self.feature_fc = nn.Linear(pre_features, 512)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (LayerNorm, nn.LayerNorm)):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_features(self, x):
+        hidden_states = []
+
+        x = self.downsample_layers[0](x)
+        x = self.stages[0](x)
+
+        hidden_states.append(x)
+
+        for i in range(1, 4):
+            # print('x shape before downsample', x.shape)
+            x = self.downsample_layers[i](x)
+            # print('x shape after downsample', x.shape)
+            x = self.stages[i](x)
+            if i == 3:  # Reshape the output of the last stage
+                x = einops.rearrange(x, "b c h w d -> b (h w d) c")
+            hidden_states.append(x)
+        x = x.reshape(x.shape[0], -1)
+        x = self.feature_fc(x)
+        return x, hidden_states
+
+    def forward(self, x):
+        x, hidden_states = self.forward_features(x)
+        return x, hidden_states
+
+
+class UnetrUpBlock(nn.Module):
+    def __init__(
+            self,
+            spatial_dims: int,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: Union[Sequence[int], int],
+            upsample_kernel_size: Union[Sequence[int], int],
+            norm_name: Union[Tuple, str],
+            proj_size: int = 64,
+            num_heads: int = 4,
+            out_size: int = 0,
+            depth: int = 3,
+            conv_decoder: bool = False,
+    ) -> None:
+        """
+        Args:
+            spatial_dims: number of spatial dimensions.
+            in_channels: number of input channels.
+            out_channels: number of output channels.
+            kernel_size: convolution kernel size.
+            upsample_kernel_size: convolution kernel size for transposed convolution layers.
+            norm_name: feature normalization type and arguments.
+            proj_size: projection size for keys and values in the spatial attention module.
+            num_heads: number of heads inside each EPA module.
+            out_size: spatial size for each decoder.
+            depth: number of blocks for the current decoder stage.
+        """
+
+        super().__init__()
+        upsample_stride = upsample_kernel_size
+        self.transp_conv = get_conv_layer(
+            spatial_dims,
+            in_channels,
+            out_channels,
+            kernel_size=upsample_kernel_size,
+            stride=upsample_stride,
+            conv_only=True,
+            is_transposed=True,
+        )
+
+        # 4 feature resolution stages, each consisting of multiple residual blocks
+        self.decoder_block = nn.ModuleList()
+
+        # If this is the last decoder, use ConvBlock(UnetResBlock) instead of EPA_Block (see suppl. material in the paper)
+        if conv_decoder == True:
+            self.decoder_block.append(
+                UnetResBlock(spatial_dims, out_channels, out_channels, kernel_size=kernel_size, stride=1,
+                             norm_name=norm_name, ))
+        else:
+            stage_blocks = []
+            for j in range(depth):
+                stage_blocks.append(TransformerBlock(input_size=out_size, hidden_size=out_channels, proj_size=proj_size, num_heads=num_heads,
+                                                     dropout_rate=0.15, pos_embed=True))
+            self.decoder_block.append(nn.Sequential(*stage_blocks))
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.LayerNorm)):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, inp, skip):
+
+        out = self.transp_conv(inp)
+        out = out + skip
+        out = self.decoder_block[0](out)
+
+        return out
